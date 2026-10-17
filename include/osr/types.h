@@ -154,6 +154,26 @@ constexpr bool osm_id_less(OsmIdx const lhs, OsmIdx const rhs) {
   return encoded_osm_id_less(to_idx(lhs), to_idx(rhs));
 }
 
+// Ways generated to cross walkable areas get ids outside of the OSM id space
+// (and therefore sort behind all OSM ways, which ways::find_way relies on).
+// The lower bits contain the id of the way / relation the area was made from.
+constexpr auto const kAreaWayBit = std::uint64_t{1U} << 62U;
+constexpr auto const kAreaWayFromRelationBit = std::uint64_t{1U} << 61U;
+constexpr auto const kAreaWayNegativeIdBit = std::uint64_t{1U} << 60U;
+
+// Junctions of the ways crossing an area (where they meet inside of it) are
+// routing nodes without OSM node.
+constexpr auto const kAreaNodeBit = std::uint64_t{1U} << 62U;
+
+constexpr bool is_area_node(osm_node_idx_t const i) {
+  return (to_idx(i) & (kEncodedNegativeOsmIdBit | kAreaNodeBit)) ==
+         kAreaNodeBit;
+}
+
+constexpr bool is_area_way(osm_way_idx_t const i) {
+  return (to_idx(i) & (kEncodedNegativeOsmIdBit | kAreaWayBit)) == kAreaWayBit;
+}
+
 using way_idx_t = cista::strong<std::uint32_t, struct way_idx_>;
 using node_idx_t = cista::strong<std::uint32_t, struct node_idx_>;
 

@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@
 
 #include "osr/elevation_storage.h"
 #include "osr/extract/conditional_parser.h"
+#include "osr/extract/area_ways.h"
 #include "osr/extract/osm_areas.h"
 #include "osr/extract/tag_parser.h"
 #include "osr/extract/tags.h"
@@ -334,6 +336,13 @@ std::pair<node_properties, level_bits_t> get_node_properties(tags const& t) {
   return {p, t.level_bits_};
 }
 
+// Areas that are crossed by generated ways (see area_ways): only the highway
+// types that are mapped as areas where people walk freely. Other types with
+// area=yes are mostly outlines of linear features.
+bool is_area_highway(tags const& t) {
+  return t.highway_ == "pedestrian"sv || t.highway_ == "footway"sv;
+}
+
 struct way_handler : public osmium::handler::Handler {
   using is_transparent = void;
 
@@ -368,11 +377,15 @@ struct way_handler : public osmium::handler::Handler {
   way_handler(ways& w,
               platforms* platforms,
               rel_ways_t const& rel_ways,
-              hash_map<osm_node_idx_t, level_bits_t>& elevator_nodes)
+              hash_map<osm_node_idx_t, level_bits_t>& elevator_nodes,
+              area_ways& walkable_areas,
+              hash_set<osm_way_idx_t> const& walkable_area_members)
       : w_{w},
         platforms_{platforms},
         rel_ways_{rel_ways},
-        elevator_nodes_{elevator_nodes} {
+        elevator_nodes_{elevator_nodes},
+        walkable_areas_{walkable_areas},
+        walkable_area_members_{walkable_area_members} {
     strings_set_.hash_function().strings_ = &w_.strings_;
     strings_set_.key_eq().strings_ = &w_.strings_;
   }
@@ -393,6 +406,26 @@ struct way_handler : public osmium::handler::Handler {
       auto const first_node = to_osm_node_idx(w.nodes().front().ref());
       auto const l = std::scoped_lock{elevator_nodes_mutex_};
       elevator_nodes_.emplace(first_node, t.level_bits_);
+    }
+
+    // Linear barriers that cannot be walked through: adjacent walkable areas
+    // are not merged across them.
+    if (!t.barrier_.empty()) {
+      switch (cista::hash(t.barrier_)) {
+        case cista::hash("no"):
+        case cista::hash("kerb"):
+        case cista::hash("bollard"):
+        case cista::hash("cycle_barrier"):
+        case cista::hash("height_restrictor"):
+        case cista::hash("entrance"): break;
+        default: {
+          auto barrier = std::vector<osm_node_idx_t>{};
+          for (auto const& n : w.nodes()) {
+            barrier.push_back(to_osm_node_idx(n.ref()));
+          }
+          walkable_areas_.add_barrier(barrier);
+        }
+      }
     }
 
     if (!t.is_elevator_ &&  // elevators tagged as building would be landuse
@@ -429,6 +462,15 @@ struct way_handler : public osmium::handler::Handler {
     auto const get_point = [](osmium::NodeRef const& n) {
       return point::from_location(n.location());
     };
+
+    // Walkable areas: the outline is routable like any other way, the ways
+    // crossing the area are generated after all ways are known (area_ways).
+    auto const is_closed = w.nodes().size() > 3U &&
+                           w.nodes().front().ref() == w.nodes().back().ref();
+    auto const is_walkable_area =
+        is_closed && t.is_area_ && is_area_highway(t) && !t.is_platform() &&
+        !t.is_elevator_ && !t.is_parking_ && p.is_foot_accessible() &&
+        t.conditional_tags_.empty() && t.access_conditional_no_.empty();
 
     auto const get_node_id = [&](osmium::NodeRef const& n) {
       auto const idx = to_osm_node_idx(n.ref());
@@ -478,6 +520,12 @@ struct way_handler : public osmium::handler::Handler {
 
     w_.way_osm_idx_.push_back(to_osm_way_idx(w.id()));
     w_.r_->way_properties_.emplace_back(p);
+    if (is_walkable_area && !walkable_area_members_.contains(osm_way_idx)) {
+      walkable_areas_.add_way(way_idx);
+    }
+    if (t.is_off_ground_) {
+      walkable_areas_.set_off_ground(way_idx);
+    }
     if (hgv_info.has_value()) {
       w_.r_->way_hgv_info_.emplace_back(way_idx, *hgv_info);
     }
@@ -515,6 +563,9 @@ struct way_handler : public osmium::handler::Handler {
 
   std::mutex elevator_nodes_mutex_;
   hash_map<osm_node_idx_t, level_bits_t>& elevator_nodes_;
+
+  area_ways& walkable_areas_;
+  hash_set<osm_way_idx_t> const& walkable_area_members_;
 };
 
 // A turn-restriction relation with its way/node members already resolved,
@@ -744,14 +795,41 @@ void extract(bool const with_platforms,
                       ? std::make_unique<walkable_area_collector>(w)
                       : nullptr;
 
+  // Walkable multipolygons (e.g. pedestrian squares): their member ways are
+  // routable already (rel_ways), area_ways adds the ways crossing them.
+  // EVAL-ONLY: experiment switches.
+  auto area_opt = area_routing_options{};
+  auto interior = area_ways::interior_entries::kAllNodes;
+  if (auto const* x = std::getenv("OSR_AREA_STRETCH"); x != nullptr) {
+    area_opt.max_stretch_ = std::stod(x);
+  }
+  if (auto const* x = std::getenv("OSR_AREA_MAX_WAYS"); x != nullptr) {
+    area_opt.max_ways_per_node_ = static_cast<std::uint32_t>(std::stoul(x));
+  }
+  if (std::getenv("OSR_AREA_VISIBILITY") != nullptr) {
+    area_opt.all_visibility_edges_ = true;
+  }
+  if (auto const* x = std::getenv("OSR_AREA_INTERIOR"); x != nullptr) {
+    interior = std::string_view{x} == "dead"
+                   ? area_ways::interior_entries::kDeadEnds
+                   : (std::string_view{x} == "routing"
+                          ? area_ways::interior_entries::kRoutingNodes
+                          : area_ways::interior_entries::kAllNodes);
+  }
+  auto walkable_areas = area_ways{w, area_opt, interior};
+  auto walkable_area_members = hash_set<osm_way_idx_t>{};
+
   // Timezone / low emission zone (and, with a walkable areas hook, walkable
   // multipolygon) relations, stored (owned) in pass 1 for assembly after the
   // ways pass collected the member way geometries.
   struct area_relation {
     std::int64_t id_;
+    bool walkable_;
+    way_properties p_;
     std::vector<std::tuple<std::int64_t, std::string, osm::member_type>>
         members_;
     std::vector<std::pair<std::string, std::string>> tags_;
+    bool off_ground_{false};
   };
   auto area_relations = std::vector<area_relation>{};
 
@@ -788,6 +866,7 @@ void extract(bool const with_platforms,
       osm::hybrid_block_encoder enc_;
       osm::hybrid_block nodes_;
       std::vector<std::uint64_t> blocking_nodes_;
+      std::vector<osm_node_idx_t> foot_blocked_nodes_;
       osmium::memory::Buffer rels_{1U << 12U,
                                    osmium::memory::Buffer::auto_grow::yes};
       std::vector<area_relation> area_relations_;
@@ -802,10 +881,13 @@ void extract(bool const with_platforms,
           ctx.max_node_id_ = std::max(ctx.max_node_id_, id);
           if (std::ranges::begin(tag_range) != std::ranges::end(tag_range)) {
             auto const t = tags{osm_obj_type::kNode, tag_range};
+            auto const foot = is_accessible<foot_profile>(t, osm_obj_type::kNode);
             auto const accessible =
                 is_accessible<car_profile>(t, osm_obj_type::kNode) &&
-                is_accessible<bike_profile>(t, osm_obj_type::kNode) &&
-                is_accessible<foot_profile>(t, osm_obj_type::kNode);
+                is_accessible<bike_profile>(t, osm_obj_type::kNode) && foot;
+            if (!foot) {
+              ctx.foot_blocked_nodes_.push_back(to_osm_node_idx(id));
+            }
             if (!accessible || t.is_elevator_ || t.is_platform()) {
               ctx.blocking_nodes_.push_back(to_idx(to_osm_node_idx(id)));
             }
@@ -822,20 +904,34 @@ void extract(bool const with_platforms,
             auto&& tag_range) {
           auto const& rel =
               osm::build_relation(ctx.scratch_, id, members, tag_range);
-          auto const p = get_way_properties(tags{rel}, osm_obj_type::kRelation);
+          auto const rel_tags = tags{rel};
+          auto const p = get_way_properties(rel_tags, osm_obj_type::kRelation);
+          auto const* type = rel.tags()["type"];
+          auto const is_zone = is_area_relation(rel.tags());
+          auto const is_walkable_area =
+              !is_zone && type != nullptr &&
+              std::string_view{type} == "multipolygon"sv &&
+              is_area_highway(rel_tags) && !rel_tags.is_platform() &&
+              p.is_foot_accessible() && rel_tags.conditional_tags_.empty() &&
+              rel_tags.access_conditional_no_.empty();
 
           // Area (timezone / LEZ) relations: register their member ways now
           // (mp.save_ways_of_relation is mutex-guarded and order-independent)
           // and stash the relation for the post-ways assembly pass. These are
-          // never routable, so they don't go into rels_.
-          if (is_area_relation(rel.tags())) {
+          // never routable, so they don't go into rels_. Walkable areas are
+          // assembled the same way.
+          if (is_zone || is_walkable_area) {
             // save_ways_of_relation only reads the member refs + tags, so it
             // takes the decoded ranges directly -- no owned copy needed.
             mp.save_ways_of_relation(id, members, tag_range);
 
             // The assembly pass runs after pass 2, so it needs owned copies of
             // the members (with roles) and tags that outlive this block.
-            auto ar = area_relation{.id_ = id, .members_ = {}, .tags_ = {}};
+            auto ar = area_relation{.id_ = id,
+                                    .walkable_ = is_walkable_area,
+                                    .p_ = p,
+                                    .members_ = {},
+                                    .tags_ = {}};
             for (auto const& m : rel.members()) {
               ar.members_.emplace_back(m.ref(), std::string{m.role()},
                                        to_member_type(m.type()));
@@ -843,6 +939,7 @@ void extract(bool const with_platforms,
             for (auto const& t : rel.tags()) {
               ar.tags_.emplace_back(t.key(), t.value());
             }
+            ar.off_ground_ = rel_tags.is_off_ground_;
             ctx.area_relations_.push_back(std::move(ar));
           }
 
@@ -858,8 +955,18 @@ void extract(bool const with_platforms,
           for (auto const id : ctx.blocking_nodes_) {
             w.node_way_counter_.increment(id);
           }
+          for (auto const n : ctx.foot_blocked_nodes_) {
+            walkable_areas.add_blocked_node(n);
+          }
           osmium::apply(ctx.rels_, rel_ways_h);
           for (auto& ar : ctx.area_relations_) {
+            if (ar.walkable_) {
+              for (auto const& [ref, role, member_type] : ar.members_) {
+                if (member_type == osm::member_type::kWay) {
+                  walkable_area_members.insert(to_osm_way_idx(ref));
+                }
+              }
+            }
             area_relations.push_back(std::move(ar));
           }
         },
@@ -873,7 +980,12 @@ void extract(bool const with_platforms,
   {  // Pass 2: extract streets, collect area member way geometries.
     pt->status("Load OSM / Ways").in_high(blocks.size()).out_bounds(15, 38);
 
-    auto h = way_handler{w, pl.get(), rel_ways, elevator_nodes};
+    auto h = way_handler{w,
+                         pl.get(),
+                         rel_ways,
+                         elevator_nodes,
+                         walkable_areas,
+                         walkable_area_members};
     auto walkable_h = std::optional<walkable_area_way_handler>{};
     if (walkable != nullptr) {
       walkable_h.emplace(*walkable);
@@ -938,7 +1050,41 @@ void extract(bool const with_platforms,
         1U << 12U, osmium::memory::Buffer::auto_grow::yes};
     for (auto const& ar : area_relations) {
       auto const pa = mp.assemble_area(ar.id_, ar.members_, ar.tags_);
-      if (pa.valid) {
+      if (pa.valid && ar.walkable_) {
+        auto member_ways = std::vector<way_idx_t>{};
+        for (auto const& [ref, role, member_type] : ar.members_) {
+          if (member_type != osm::member_type::kWay) {
+            continue;
+          }
+          if (auto const way = w.find_way(to_osm_way_idx(ref))) {
+            member_ways.push_back(*way);
+          }
+        }
+        if (!member_ways.empty()) {
+          auto const to_ring = [](std::span<osm::node_ref const> const nodes) {
+            auto ring = area_ways::ring{};
+            for (auto const& n : nodes) {
+              ring.emplace_back(
+                  to_osm_node_idx(n.ref()),
+                  point{.lat_ = n.location().lng_, .lng_ = n.location().lat_});
+            }
+            if (ring.size() > 1U && ring.front().first == ring.back().first) {
+              ring.pop_back();
+            }
+            return ring;
+          };
+          for (auto const& part : pa.area) {
+            auto rings = std::vector<area_ways::ring>{};
+            rings.push_back(to_ring(part.get_outer()));
+            for (auto i = 0U; i + 1U < part.offsets.size(); ++i) {
+              rings.push_back(to_ring(part.get_inner_at(i)));
+            }
+            walkable_areas.add_relation(ar.id_, std::move(rings), member_ways,
+                                        ar.p_, ar.off_ground_);
+          }
+        }
+      }
+      if (pa.valid && (!ar.walkable_ || walkable != nullptr)) {
         auto const& area = osm::build_area(scratch, pa, ar.tags_);
         areas.add_area(area);
         if (walkable != nullptr) {
@@ -950,6 +1096,40 @@ void extract(bool const with_platforms,
       }
       pt->increment();
     }
+  }
+
+  {  // Generate the ways crossing walkable areas.
+    auto const start = std::chrono::steady_clock::now();
+    auto const s = walkable_areas.build();
+    std::clog << fmt::format(
+        "osr: walkable areas ({} ms): {} total, {} without two entries, {} too "
+        "large, {} invalid, {} with mixed levels, {} ok -> {} ways with {} "
+        "nodes and {} junctions from {} visibility edges, {} pairs over the "
+        "ways per node limit, {} ways over the node limit; {} entries inside of {} "
+        "areas, {} areas ok only with them, {} areas without them (limits), "
+        "{} new routing nodes, {} outline crossings without common node\n",
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count(),
+        s.n_areas_, s.n_no_entries_, s.n_too_large_, s.n_invalid_,
+        s.n_mixed_levels_, s.n_ok_,
+        s.n_ways_, s.n_way_nodes_, s.n_junctions_, s.n_visibility_edges_,
+        s.n_capped_,
+        s.n_over_node_budget_, s.n_interior_entries_, s.n_with_interior_,
+        s.n_ok_by_interior_, s.n_interior_dropped_, s.n_new_routing_nodes_,
+        s.n_crossings_);
+    std::clog << fmt::format(
+        "osr: walkable areas merged: {} groups of {} areas (sizes 2: {}, 3: "
+        "{}, 4: {}, 5-8: {}, 9-16: {}, 17+: {}), {} shared segments removed, "
+        "not merged: {} segments with different properties, {} with a "
+        "barrier, {} with overlapping areas, {} invalid groups, {} too large "
+        "groups; {} touch nodes, {} ways on removed segments\n",
+        s.n_merged_groups_, s.n_merged_areas_, s.group_sizes_[0],
+        s.group_sizes_[1], s.group_sizes_[2], s.group_sizes_[3],
+        s.group_sizes_[4], s.group_sizes_[5], s.n_removed_segments_,
+        s.n_incompatible_segments_, s.n_blocked_segments_,
+        s.n_conflict_segments_, s.n_failed_groups_, s.n_too_large_groups_,
+        s.n_touch_nodes_, s.n_on_removed_);
   }
 
   if (walkable != nullptr) {  // Walkable areas: connectors and obstacles.
@@ -1138,6 +1318,7 @@ void extract(bool const with_platforms,
         },
         pt->update_fn());
   }
+  walkable_areas.set_junction_nodes();
 
   w.add_restriction(r);
 

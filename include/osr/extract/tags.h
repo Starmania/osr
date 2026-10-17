@@ -60,6 +60,13 @@ private:
           landuse_ = true;
           break;
         case cista::hash("landuse"): landuse_ = true; break;
+        case cista::hash("area"): is_area_ = value == "yes"sv; break;
+        case cista::hash("layer"): is_off_ground_ |= value != "0"sv; break;
+        case cista::hash("tunnel"): [[fallthrough]];
+        case cista::hash("bridge"): is_off_ground_ |= value != "no"sv; break;
+        case cista::hash("location"):
+          is_off_ground_ |= value == "underground"sv;
+          break;
         case cista::hash("railway"):
           railway_ = value;
           landuse_ |= railway_ == "station_area"sv;
@@ -367,6 +374,12 @@ public:
 
   // https://wiki.openstreetmap.org/wiki/Key:landuse
   bool landuse_{false};
+
+  // https://wiki.openstreetmap.org/wiki/Key:area
+  bool is_area_{false};
+
+  // Not on the ground: layer != 0, tunnel, bridge or underground.
+  bool is_off_ground_{false};
 
   // https://wiki.openstreetmap.org/wiki/Key:construction
   bool is_construction_{false};

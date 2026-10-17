@@ -263,7 +263,9 @@ void ways::compute_big_street_neighbors() {
       n_ways(), [&](state& s, std::size_t const i) {
         auto const way = way_idx_t{i};
 
-        if (is_orig_big_street[to_idx(way)]) {
+        // Ways crossing walkable areas lead away from the street.
+        if (is_orig_big_street[to_idx(way)] ||
+            is_area_way(way_osm_idx_[way])) {
           pt->update_monotonic(i);
           return;
         }

@@ -160,6 +160,11 @@ void lookup::build_rtree() {
                    });
 
   for (auto way : sorted_ways) {
+    // Ways generated to cross areas only connect the entries of the area:
+    // matching a location to them would lead to one of their (far) ends.
+    if (is_area_way(ways_.way_osm_idx_[way])) {
+      continue;
+    }
     auto b = geo::box{};
     for (auto const& c : ways_.way_polylines_[way]) {
       b.extend(c);

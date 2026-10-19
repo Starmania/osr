@@ -85,6 +85,8 @@ struct restriction {
       conditional_condition_set_idx_t::invalid()};
 };
 
+static_assert(sizeof(restriction) == 8U);
+
 enum class hgv_info_field : std::uint16_t {
   kAccessFwd = 1U << 0U,
   kAccessBwd = 1U << 1U,

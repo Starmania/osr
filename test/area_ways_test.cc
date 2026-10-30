@@ -63,6 +63,8 @@ constexpr auto const kNodes = R"osm(
   <node id="51" version="1" lat="48.0022695" lon="9.0016110"/>
   <node id="52" version="1" lat="48.0030779" lon="9.0001342"/>
   <node id="53" version="1" lat="48.0030779" lon="9.0004027"/>
+  <node id="60" version="1" lat="48.0000" lon="9.00067"/>
+  <node id="61" version="1" lat="48.0009" lon="9.00067"/>
 )osm";
 
 constexpr auto const kFootways = R"osm(
@@ -115,7 +117,9 @@ struct graph {
     fs::remove_all(dir_, ec);
     fs::create_directories(dir_, ec);
 
-    osr::extract(false, osm_path.generic_string(), dir_, {});
+    osr::extract(
+        false, osm_path.generic_string(), dir_, {},
+        {.approach_ = osr::area_routing_config::approach::kSpanner});
     w_ = std::make_unique<osr::ways>(dir_, cista::mmap::protection::READ);
     l_ = std::make_unique<osr::lookup>(*w_, dir_,
                                        cista::mmap::protection::READ);
@@ -124,7 +128,7 @@ struct graph {
   osr::path route(osr::location const& from, osr::location const& to) const {
     auto const p = osr::route(
         osr::get_parameters(osr::search_profile::kFoot), *w_, *l_,
-        osr::search_profile::kFoot, from, to, 10'000U,
+        osr::search_profile::kFoot, from, to, std::chrono::seconds{10'000},
         osr::direction::kForward, 50.0, nullptr, nullptr, nullptr,
         osr::routing_algorithm::kDijkstra);
     EXPECT_TRUE(p.has_value());
@@ -138,6 +142,15 @@ struct graph {
   unsigned n_area_ways() const {
     return static_cast<unsigned>(
         std::ranges::count_if(w_->way_osm_idx_, osr::is_area_way));
+  }
+
+  // Does a generated way end at the node?
+  bool has_area_way_at(std::uint64_t const osm_node) const {
+    auto const n = w_->find_node_idx(osr::osm_node_idx_t{osm_node});
+    return n.has_value() &&
+           std::ranges::any_of(w_->r_->node_ways_[*n], [&](auto const way) {
+             return osr::is_area_way(w_->way_osm_idx_[way]);
+           });
   }
 
   bool uses_area_way(osr::path const& p) const {
@@ -258,6 +271,51 @@ TEST(area_ways, area_without_tag_is_not_crossed) {
   EXPECT_NEAR(263.0, g.route(kSouthWest, kNorthEast).dist_, 4.0);
 }
 
+TEST(area_ways, platforms_and_other_highways_are_areas) {
+  // Same square with the other tags that make an area.
+  auto const crossed = [](std::string_view const name,
+                          std::string_view const tags) {
+    auto const g = graph{name, fmt::format(R"osm(
+  <way id="100" version="1">
+    <nd ref="1"/><nd ref="2"/><nd ref="6"/><nd ref="3"/><nd ref="4"/>
+    <nd ref="5"/><nd ref="1"/>
+    {}
+    <tag k="area" v="yes"/>
+  </way>)osm",
+                                           tags)};
+    return g.n_area_ways() != 0U &&
+           std::abs(g.route(kWest, kEast).dist_ - 145.0) < 4.0;
+  };
+  // railway=platform alone is not walkable in osr (no foot access without
+  // public_transport=platform), neither is its outline.
+  EXPECT_FALSE(crossed("osr_area_ways_railway_platform",
+                       R"(<tag k="railway" v="platform"/>)"));
+  EXPECT_TRUE(crossed("osr_area_ways_railway_pt_platform",
+                      R"(<tag k="railway" v="platform"/>
+    <tag k="public_transport" v="platform"/>)"));
+  EXPECT_TRUE(crossed("osr_area_ways_pt_platform",
+                      R"(<tag k="public_transport" v="platform"/>)"));
+  EXPECT_TRUE(
+      crossed("osr_area_ways_service", R"(<tag k="highway" v="service"/>)"));
+  EXPECT_TRUE(crossed("osr_area_ways_corridor",
+                      R"(<tag k="highway" v="corridor"/>)"));
+  EXPECT_FALSE(crossed("osr_area_ways_residential",
+                       R"(<tag k="highway" v="residential"/>)"));
+}
+
+TEST(area_ways, station_is_no_area) {
+  // A station covers all of its levels.
+  auto const g = graph{"osr_area_ways_station", R"osm(
+  <way id="100" version="1">
+    <nd ref="1"/><nd ref="2"/><nd ref="6"/><nd ref="3"/><nd ref="4"/>
+    <nd ref="5"/><nd ref="1"/>
+    <tag k="highway" v="pedestrian"/>
+    <tag k="public_transport" v="station"/>
+    <tag k="area" v="yes"/>
+  </way>)osm"};
+  EXPECT_EQ(0U, g.n_area_ways());
+}
+
 TEST(area_ways, multipolygon_with_hole) {
   // Hole: 40m x 40m in the center, blocks the straight line from 5 to 6.
   auto const g = graph{"osr_area_ways_multipolygon", R"osm(
@@ -365,7 +423,7 @@ TEST(area_ways, crossing_footway_can_be_left_at_every_node) {
 TEST(area_ways, ways_not_on_the_area_are_not_connected) {
   // Not connected to the square: a footway that ends on the outline, but
   // not in one of its nodes (15), a tunnel that ends below the center, a
-  // footway on another level and steps.
+  // footway on another level and one in a lower layer.
   auto const g = graph{"osr_area_ways_not_connected", kSquare, R"osm(
   <way id="20" version="1">
     <nd ref="14"/><nd ref="15"/>
@@ -381,10 +439,6 @@ TEST(area_ways, ways_not_on_the_area_are_not_connected) {
     <tag k="highway" v="footway"/>
     <tag k="level" v="-1"/>
   </way>
-  <way id="23" version="1">
-    <nd ref="16"/><nd ref="33"/>
-    <tag k="highway" v="steps"/>
-  </way>
   <way id="24" version="1">
     <nd ref="16"/><nd ref="31"/>
     <tag k="highway" v="footway"/>
@@ -392,7 +446,7 @@ TEST(area_ways, ways_not_on_the_area_are_not_connected) {
   </way>)osm"};
   auto const plain = graph{"osr_area_ways_not_connected_plain", kSquare};
   EXPECT_EQ(plain.n_area_ways(), g.n_area_ways());
-  for (auto const n : {15U, 30U, 31U, 32U, 33U}) {
+  for (auto const n : {15U, 30U, 31U, 32U}) {
     EXPECT_FALSE(g.is_routing_node(n)) << n;
   }
   EXPECT_NEAR(204.0, g.route(kSouthWest, kNorthEast).dist_, 4.0);
@@ -435,4 +489,96 @@ TEST(area_ways, entry_inside_multipolygon_but_not_in_its_hole) {
   auto const around = g.route(kQuarter, kEast);
   EXPECT_TRUE(g.uses_area_way(around));
   EXPECT_NEAR(121.0, around.dist_, 4.0);
+}
+
+TEST(area_ways, building_on_the_square_is_a_hole) {
+  // Same hole as in multipolygon_with_hole, mapped as a building.
+  auto const building = [](std::string_view const name,
+                           std::string_view const tags) {
+    return graph{name, kSquare, fmt::format(R"osm(
+  <way id="102" version="1">
+    <nd ref="20"/><nd ref="21"/><nd ref="22"/><nd ref="23"/><nd ref="20"/>
+    {}
+  </way>)osm",
+                                            tags)};
+  };
+
+  // 2 x 22m + around the building: 2 x 36m + 40m.
+  auto const g = building("osr_area_ways_building",
+                          R"(<tag k="building" v="yes"/>)");
+  auto const around = g.route(kWest, kEast);
+  EXPECT_TRUE(g.uses_area_way(around));
+  EXPECT_NEAR(157.0, around.dist_, 4.0);
+
+  // Not in the way: a roof, a building on pillars, on another level.
+  for (auto const& [name, tags] :
+       {std::pair{"osr_area_ways_roof", R"(<tag k="building" v="roof"/>)"},
+        std::pair{"osr_area_ways_pillars",
+                  R"(<tag k="building" v="yes"/>
+                     <tag k="building:min_level" v="1"/>)"},
+        std::pair{"osr_area_ways_level",
+                  R"(<tag k="building" v="yes"/><tag k="level" v="1"/>)"}}) {
+    EXPECT_NEAR(145.0, building(name, tags).route(kWest, kEast).dist_, 4.0)
+        << name;
+  }
+}
+
+TEST(area_ways, fence_across_the_square) {
+  // Fence from the south to the north side (not connected to the outline).
+  constexpr auto kFence = R"osm(
+  <way id="200" version="1">
+    <nd ref="60"/><nd ref="30"/><nd ref="61"/>
+    <tag k="barrier" v="fence"/>
+    {}
+  </way>)osm";
+
+  // Along the outline: 2 x 22m + 50m + 100m + 50m.
+  auto const g =
+      graph{"osr_area_ways_fence", kSquare, fmt::format(kFence, "")};
+  EXPECT_NEAR(244.0, g.route(kWest, kEast).dist_, 6.0);
+
+  // A footway that passes the fence in the center: straight across.
+  auto const gate = graph{"osr_area_ways_fence_gate", kSquare,
+                          fmt::format(kFence, "") + R"osm(
+  <way id="201" version="1">
+    <nd ref="31"/><nd ref="30"/>
+    <tag k="highway" v="footway"/>
+  </way>)osm"};
+  EXPECT_NEAR(145.0, gate.route(kWest, kEast).dist_, 4.0);
+
+  // A fence on a bridge does not block the square.
+  auto const bridge =
+      graph{"osr_area_ways_fence_bridge", kSquare,
+            fmt::format(kFence, R"(<tag k="layer" v="1"/>)")};
+  EXPECT_NEAR(145.0, bridge.route(kWest, kEast).dist_, 4.0);
+}
+
+TEST(area_ways, steps_and_elevators_are_entries_on_any_level) {
+  // Steps from the square (33) down to a tunnel (30, below the center), and
+  // a tunnel footway with an elevator (32) that ends in the square.
+  auto const g = graph{"osr_area_ways_steps", kSquare, R"osm(
+  <node id="70" version="1" lat="48.00060" lon="9.00067">
+    <tag k="highway" v="elevator"/>
+  </node>
+  <way id="20" version="1">
+    <nd ref="33"/><nd ref="30"/>
+    <tag k="highway" v="steps"/>
+    <tag k="level" v="-1;0"/>
+  </way>
+  <way id="21" version="1">
+    <nd ref="30"/><nd ref="16"/>
+    <tag k="highway" v="footway"/>
+    <tag k="tunnel" v="yes"/>
+    <tag k="level" v="-1"/>
+  </way>
+  <way id="22" version="1">
+    <nd ref="16"/><nd ref="70"/><nd ref="32"/>
+    <tag k="highway" v="footway"/>
+    <tag k="tunnel" v="yes"/>
+    <tag k="level" v="-1"/>
+  </way>)osm"};
+  EXPECT_TRUE(g.has_area_way_at(33U));  // top of the steps
+  EXPECT_FALSE(g.has_area_way_at(30U));  // bottom, joined by the tunnel
+  EXPECT_TRUE(g.has_area_way_at(70U));  // the elevator
+  EXPECT_FALSE(g.has_area_way_at(32U));  // the tunnel itself
 }

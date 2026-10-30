@@ -59,27 +59,25 @@ level_t ground(level_t const l) {
 // Entries that are not on the outline: nodes of walkable ways strictly inside
 // an area. A walker can leave the way there and cross the area freely.
 //
-// Not every node inside an area becomes an entry:
-//  - Ends of ways (a footway that ends in the middle of a plaza) and nodes
-//    that are routing nodes anyway (two ways meet, barriers) are entries.
-//    The latter are optional (interior_entries): they do not cost routing
-//    nodes, but most of the additional ways.
-//  - All other nodes are not. They are only the shape of a way that enters
-//    the area through one of the entries above or through an outline node,
-//    and leaving the way later is never shorter than leaving it right there.
-//    Making them entries would turn every one of them into a routing node.
+// Which nodes inside an area become entries (interior_entries):
+//  - kAllNodes (default, as in the lab spec): every node. A footway that
+//    crosses the area can be left anywhere, e.g. towards an exit on the
+//    side. Costs routing nodes and generated ways.
+//  - kDeadEnds: only ends of ways (a footway that ends in the middle of a
+//    plaza), kRoutingNodes: also nodes where ways meet. The other nodes are
+//    only reached along their way then.
 //  - The first node of a closed way (a platform or a loop inside the area)
-//    is neither: it is a routing node only because it is counted twice, and
-//    an arbitrary place to connect the loop to the area. If another way
-//    starts there, the node is found as the end of that way.
+//    is no dead end: it is a routing node only because it is counted twice.
 //  - Nodes on an outline segment that are not outline nodes are not mapped
 //    as connected to the area. Where a way crosses the outline without a
 //    common node, nothing is connected either - but if it ends inside, its
 //    end is an entry like any other.
 //
 // What lies inside the outline on the map is not necessarily on the area:
-// ways on another level, in a tunnel or on a bridge are skipped, and so are
-// steps and elevators (one of their ends is on another level).
+// ways on another level, in a tunnel or on a bridge are skipped. Steps, ramps
+// and elevators connect levels: their nodes inside the area are entries on
+// any level, except where a way on another level joins them (the other end).
+// Elevator nodes on any way are entries.
 //
 // One r-tree lookup per way with the bounding boxes of all areas, then the
 // exact point-in-polygon test for the nodes of the few ways that are close to
@@ -185,6 +183,87 @@ area_ways::interior area_ways::find_interior(
     return n;
   };
 
+  auto const is_connector = [&](way_idx_t const way) {
+    return to_idx(way) < connector_.size() && connector_[to_idx(way)];
+  };
+  auto const is_elevator_node = [&](osm_node_idx_t const n) {
+    return std::ranges::binary_search(elevator_nodes_, n);
+  };
+  auto const is_walkable = [&](way_properties const& p) {
+    return p.is_foot_accessible() || p.is_bike_accessible();
+  };
+  auto const search = [&](auto const& polyline, std::vector<std::size_t>& out) {
+    auto way_box = box{};
+    for (auto const pos : polyline) {
+      way_box.extend(pos);
+    }
+    out.clear();
+    rtree_search(
+        index, way_box.min().data(), way_box.max().data(),
+        [](auto, auto, void const* item, void* udata) {
+          static_cast<std::vector<std::size_t>*>(udata)->push_back(
+              reinterpret_cast<std::size_t>(item));
+          return true;
+        },
+        &out);
+  };
+
+  // Steps and ramps connect levels: their nodes inside an area are entries
+  // whatever their level - except where a way on another level (or off the
+  // ground) joins them. That is the other end, e.g. the bottom of steps that
+  // lead down into a tunnel, which is inside of the area on the map only.
+  // Levels of the other ways at the nodes of steps and ramps close to an
+  // area (bit 63: off the ground):
+  constexpr auto kOffGroundBit = level_bits_t{1U} << 63U;
+  auto connector_nodes = hash_map<osm_node_idx_t, level_bits_t>{};
+  {
+    auto near = std::vector<std::size_t>{};
+    for (auto way = way_idx_t{0U}; way != w_.n_ways(); ++way) {
+      if (!is_connector(way) || !is_walkable(w_.r_->way_properties_[way])) {
+        continue;
+      }
+      search(w_.way_polylines_[way], near);
+      if (!near.empty()) {
+        for (auto const n : w_.way_osm_nodes_[way]) {
+          connector_nodes.emplace(n, level_bits_t{0U});
+        }
+      }
+    }
+  }
+  if (!connector_nodes.empty()) {
+    struct levels_scratch {
+      std::vector<std::pair<osm_node_idx_t, level_bits_t>> levels_;
+    };
+    auto levels = std::vector<std::pair<osm_node_idx_t, level_bits_t>>{};
+    auto levels_mutex = std::mutex{};
+    utl::parallel_for_run_threadlocal<levels_scratch>(
+        w_.n_ways(), [&](levels_scratch& s, std::size_t const idx) {
+          auto const way = way_idx_t{static_cast<way_idx_t::value_t>(idx)};
+          auto const p = w_.r_->way_properties_[way];
+          if (is_connector(way) || !is_walkable(p)) {
+            return;
+          }
+          auto const bits =
+              is_off_ground(way)
+                  ? kOffGroundBit
+                  : (level_bits_t{1U} << to_idx(ground(p.from_level()))) |
+                        (level_bits_t{1U} << to_idx(ground(p.to_level())));
+          s.levels_.clear();
+          for (auto const n : w_.way_osm_nodes_[way]) {
+            if (connector_nodes.contains(n)) {
+              s.levels_.emplace_back(n, bits);
+            }
+          }
+          if (!s.levels_.empty()) {
+            auto const lock = std::scoped_lock{levels_mutex};
+            levels.insert(end(levels), begin(s.levels_), end(s.levels_));
+          }
+        });
+    for (auto const& [n, bits] : levels) {
+      connector_nodes[n] |= bits;
+    }
+  }
+
   struct scratch {
     std::uint64_t n_crossings_{0U};
     std::vector<std::size_t> areas_;
@@ -198,9 +277,19 @@ area_ways::interior area_ways::find_interior(
       w_.n_ways(), [&](scratch& s, std::size_t const idx) {
         auto const way = way_idx_t{static_cast<way_idx_t::value_t>(idx)};
         auto const p = w_.r_->way_properties_[way];
-        if (is_outline[idx] || is_off_ground(way) ||
-            !(p.is_foot_accessible() || p.is_bike_accessible()) ||
-            p.is_steps() || p.is_elevator() || p.from_level_ != p.to_level_) {
+        if (is_outline[idx] || !is_walkable(p)) {
+          return;
+        }
+
+        // On the area: all nodes inside on the level of the area. Steps,
+        // ramps, elevators: see above. Other ways (tunnels, other levels):
+        // only elevator nodes.
+        auto const nodes = w_.way_osm_nodes_[way];
+        auto const connector = is_connector(way);
+        auto const on_area = !connector && !is_off_ground(way) &&
+                             p.from_level_ == p.to_level_;
+        if (!on_area && !connector &&
+            std::ranges::none_of(nodes, is_elevator_node)) {
           return;
         }
 
@@ -208,32 +297,18 @@ area_ways::interior area_ways::find_interior(
         if (polyline.size() < 2U) {
           return;
         }
-        auto way_box = box{};
-        for (auto const pos : polyline) {
-          way_box.extend(pos);
-        }
-
-        s.areas_.clear();
-        rtree_search(
-            index, way_box.min().data(), way_box.max().data(),
-            [](auto, auto, void const* item, void* udata) {
-              static_cast<std::vector<std::size_t>*>(udata)->push_back(
-                  reinterpret_cast<std::size_t>(item));
-              return true;
-            },
-            &s.areas_);
+        search(polyline, s.areas_);
         if (s.areas_.empty()) {
           return;
         }
 
-        auto const nodes = w_.way_osm_nodes_[way];
         auto const n = polyline.size();
         auto const is_closed = nodes.front() == nodes.back();
         s.entries_.clear();
         s.links_.clear();
         for (auto const i : s.areas_) {
           auto const& a = areas[i];
-          if (a.level_ != ground(p.from_level())) {
+          if (on_area && a.level_ != ground(p.from_level())) {
             continue;
           }
 
@@ -249,18 +324,29 @@ area_ways::interior area_ways::find_interior(
             if (s.location_[j] != point_location::kInside) {
               continue;
             }
-            auto const is_end = j == 0U || j + 1U == n;
-            auto const is_shared =
-                w_.node_way_counter_.is_multi(to_idx(nodes[j]));
-            if (interior_ == interior_entries::kAllNodes ||
-                ((is_end ? !is_closed : is_shared) &&
-                 (!is_shared ||
-                  interior_ == interior_entries::kRoutingNodes))) {
-              s.is_entry_[j] = true;
-              any = true;
+            auto is_entry = false;
+            if (on_area) {
+              auto const is_end = j == 0U || j + 1U == n;
+              auto const is_shared =
+                  w_.node_way_counter_.is_multi(to_idx(nodes[j]));
+              is_entry = interior_ == interior_entries::kAllNodes ||
+                         ((is_end ? !is_closed : is_shared) &&
+                          (!is_shared ||
+                           interior_ == interior_entries::kRoutingNodes));
+            } else if (p.is_elevator() || is_elevator_node(nodes[j])) {
+              is_entry = true;
+            } else if (connector) {
+              auto const it = connector_nodes.find(nodes[j]);
+              auto const own = level_bits_t{1U} << to_idx(a.level_);
+              is_entry =
+                  it == end(connector_nodes) || (it->second & ~own) == 0U;
             }
+            s.is_entry_[j] = is_entry;
+            any = any || is_entry;
           }
-          s.n_crossings_ += count_crossings(i, polyline);
+          if (on_area) {
+            s.n_crossings_ += count_crossings(i, polyline);
+          }
           if (!any) {
             continue;
           }
@@ -268,6 +354,7 @@ area_ways::interior area_ways::find_interior(
           // The way connects each entry to the previous and next entry on
           // it, there is no need to generate a way for these pairs. Nodes on
           // the outline can be entries as well (if they are outline nodes).
+          // Not for steps and ramps: they do not replace a flat way.
           auto last = n;
           auto length = 0.0;
           for (auto j = 0U; j != n; ++j) {
@@ -281,7 +368,8 @@ area_ways::interior area_ways::find_interior(
             } else if (s.location_[j] != point_location::kBoundary) {
               continue;
             }
-            if (last != n && (s.is_entry_[last] || s.is_entry_[j]) &&
+            if (on_area && last != n &&
+                (s.is_entry_[last] || s.is_entry_[j]) &&
                 nodes[last] != nodes[j] && p.is_foot_accessible()) {
               s.links_.push_back(
                   {static_cast<std::uint32_t>(i),

@@ -230,6 +230,13 @@ const style = (map, level, theme) => {
     map.setStyle({
         version: 8,
         sources: {
+            'osm-raster': {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                maxzoom: 19,
+                attribution: '&copy; OpenStreetMap contributors'
+            },
             osm: {
                 type: 'vector',
                 tiles: ['/{z}/{x}/{y}.mvt'],
@@ -251,6 +258,11 @@ const style = (map, level, theme) => {
                 id: 'background',
                 type: 'background',
                 paint: { 'background-color': c.background }
+            }, {
+                id: 'osm-raster',
+                type: 'raster',
+                source: 'osm-raster',
+                paint: { 'raster-opacity': 0.6 }
             },
             {
                 id: 'coastline',

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <charconv>
 #include <ranges>
 #include <string_view>
 #include <tuple>
@@ -75,7 +77,13 @@ private:
           break;
         case cista::hash("landuse"): landuse_ = true; break;
         case cista::hash("area"): is_area_ = value == "yes"sv; break;
-        case cista::hash("layer"): is_off_ground_ |= value != "0"sv; break;
+        case cista::hash("layer"): {
+          is_off_ground_ |= value != "0"sv;
+          auto layer = 0;
+          std::from_chars(value.data(), value.data() + value.size(), layer);
+          layer_ = static_cast<std::int8_t>(std::clamp(layer, -100, 100));
+          break;
+        }
         case cista::hash("tunnel"): [[fallthrough]];
         case cista::hash("bridge"): is_off_ground_ |= value != "no"sv; break;
         case cista::hash("location"):
@@ -160,6 +168,7 @@ private:
         case cista::hash("kerb"): kerb_ = value; break;
         case cista::hash("platform_edge"): is_platform_ = true; break;
         case cista::hash("public_transport"):
+          public_transport_ = value;
           switch (cista::hash(std::string_view{value})) {
             case cista::hash("platform"):
             case cista::hash("stop_position"): is_platform_ = true;
@@ -429,8 +438,14 @@ public:
   // https://wiki.openstreetmap.org/wiki/Key:area
   bool is_area_{false};
 
+  // https://wiki.openstreetmap.org/wiki/Key:public_transport
+  std::string_view public_transport_;
+
   // Not on the ground: layer != 0, tunnel, bridge or underground.
   bool is_off_ground_{false};
+
+  // https://wiki.openstreetmap.org/wiki/Key:layer
+  std::int8_t layer_{0};
 
   // https://wiki.openstreetmap.org/wiki/Key:construction
   bool is_construction_{false};

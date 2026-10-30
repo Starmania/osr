@@ -78,7 +78,7 @@ double len(osr::point const a, osr::point const b) {
 // Outline (ring_routable_) + links + generated ways (one edge per way).
 graph routing_graph(osr::area const& a, osr::area_routing_result const& r) {
   auto g = graph{};
-  for (auto i = 0U; i != a.rings_.size(); ++i) {
+  for (auto i = 0U; i != std::min(a.rings_.size(), a.n_routable_rings_); ++i) {
     auto const& ring = a.rings_[i];
     if (ring.size() < 2U) {
       continue;
@@ -94,12 +94,14 @@ graph routing_graph(osr::area const& a, osr::area_routing_result const& r) {
   for (auto const& l : a.links_) {
     g.add(l.from_, l.to_, l.length_);
   }
-  for (auto const& w : r.ways_) {
+  // Ends by end_ids_: the sides of a line vertex are different nodes.
+  for (auto k = 0U; k != r.ways_.size(); ++k) {
+    auto const& w = r.ways_[k];
     auto d = 0.0;
     for (auto i = 1U; i < w.size(); ++i) {
       d += len(get_vertex(a, w[i - 1U]).pos_, get_vertex(a, w[i]).pos_);
     }
-    g.add(get_vertex(a, w.front()).id_, get_vertex(a, w.back()).id_, d);
+    g.add(r.end_ids_[k].first, r.end_ids_[k].second, d);
   }
   return g;
 }
@@ -115,6 +117,13 @@ std::vector<std::uint64_t> entry_ids(osr::area const& a) {
   }
   for (auto const& v : a.interior_) {
     e.push_back(v.id_);
+  }
+  for (auto const& l : a.lines_) {
+    for (auto const& v : l) {
+      if (v.entry_ && !v.blocked_) {
+        e.push_back(v.id_);
+      }
+    }
   }
   std::ranges::sort(e);
   e.erase(std::unique(begin(e), end(e)), end(e));
@@ -155,6 +164,19 @@ bool read_area(std::istream& in, std::uint64_t& id, osr::area& a) {
     in >> l.from_ >> l.to_ >> l.length_;
     a.links_.push_back(l);
   }
+  // Optional: routable rings and lines (obstacles).
+  in >> std::ws;
+  if (in.peek() == 'X') {
+    auto n_lines = 0U;
+    in >> tag >> a.n_routable_rings_ >> n_lines;
+    for (auto i = 0U; i != n_lines; ++i) {
+      in >> tag >> n;
+      auto& l = a.lines_.emplace_back();
+      for (auto j = 0U; j != n; ++j) {
+        l.push_back(vertex());
+      }
+    }
+  }
   return true;
 }
 
@@ -173,6 +195,7 @@ TEST(tmp, areas) {
   auto opt = osr::area_routing_options{};
   opt.max_stretch_ = env("OSR_STRETCH", 1.02);
   opt.max_ways_per_node_ = static_cast<std::uint32_t>(env("OSR_CAP", 24));
+  opt.all_visibility_edges_ = env("OSR_VIS", 0) != 0.0;
   auto exact = osr::area_routing_options{};
   exact.max_stretch_ = 1.0;
   exact.max_ways_per_node_ = 1000000U;

@@ -7,9 +7,13 @@
 #include <ranges>
 #include <sstream>
 
+#include "rtree.h"
+
 #include "utl/parallel_for.h"
+#include "utl/verify.h"
 
 #include "osr/extract/area_merge.h"
+#include "osr/extract/point_in_polygon.h"
 #include "osr/ways.h"
 
 namespace osr {
@@ -61,12 +65,20 @@ std::uint64_t to_merge_class(way_properties const& area) {
   return c;
 }
 
+// Ways without level are on the ground.
+level_t ground(level_t const l) { return l == kNoLevel ? level_t{0.F} : l; }
+
+std::array<double, 2> to_array(point const p) {
+  return {static_cast<double>(p.lat_), static_cast<double>(p.lng_)};
+}
+
 // An area as collected from OSM.
 struct input {
   osm_way_idx_t id_;
   way_properties p_;
   string_idx_t name_;
   bool mixed_levels_;
+  std::int8_t layer_;
 };
 
 struct generated {
@@ -74,6 +86,8 @@ struct generated {
   way_properties p_;
   string_idx_t name_;
   bool mixed_levels_{false};
+  std::int8_t layer_{0};
+  std::uint32_t n_holes_{0U}, n_lines_{0U};
   area_routing_status status_{area_routing_status::kOk};
   std::uint64_t n_visibility_edges_{0U};
   std::uint64_t n_capped_{0U};
@@ -93,21 +107,96 @@ struct unit {
 
 }  // namespace
 
-void area_ways::add_way(way_idx_t const way) { way_areas_.push_back(way); }
+area_ways::area_ways(ways& w,
+                     area_routing_options const& opt,
+                     interior_entries const interior)
+    : w_{w}, opt_{opt}, interior_{interior} {}
+
+area_ways::~area_ways() {
+  if (area_index_ != nullptr) {
+    rtree_free(static_cast<rtree*>(area_index_));
+  }
+}
+
+void area_ways::add_way(way_idx_t const way, std::int8_t const layer) {
+  way_areas_.push_back(way);
+  way_area_layers_.push_back(layer);
+}
 
 void area_ways::add_relation(std::int64_t const relation_id,
                              std::vector<ring> rings,
                              std::vector<way_idx_t> member_ways,
                              way_properties const p,
-                             bool const off_ground) {
-  relation_areas_.push_back(
-      {relation_id, std::move(rings), std::move(member_ways), p, off_ground});
+                             bool const off_ground,
+                             std::int8_t const layer) {
+  relation_areas_.push_back({relation_id, std::move(rings),
+                             std::move(member_ways), p, off_ground, layer});
+}
+
+void area_ways::index_areas() {
+  auto* const index = rtree_new();
+  utl::verify(index != nullptr, "area rtree creation failed");
+  area_index_ = index;
+  auto const insert = [&](auto const& positions) {
+    auto min = point{std::numeric_limits<std::int32_t>::max(),
+                     std::numeric_limits<std::int32_t>::max()};
+    auto max = point{std::numeric_limits<std::int32_t>::min(),
+                     std::numeric_limits<std::int32_t>::min()};
+    for (point const p : positions) {
+      min = {std::min(min.lat_, p.lat_), std::min(min.lng_, p.lng_)};
+      max = {std::max(max.lat_, p.lat_), std::max(max.lng_, p.lng_)};
+    }
+    if (min.lat_ <= max.lat_) {
+      rtree_insert(index, to_array(min).data(), to_array(max).data(), nullptr);
+    }
+  };
+  for (auto const way : way_areas_) {
+    insert(w_.way_polylines_[way]);
+  }
+  for (auto const& rel : relation_areas_) {
+    if (!rel.rings_.empty()) {
+      insert(rel.rings_.front() |
+             std::views::transform([](auto const& x) { return x.second; }));
+    }
+  }
+}
+
+bool area_ways::is_near_area(point const min, point const max) const {
+  if (area_index_ == nullptr) {
+    return false;
+  }
+  auto found = false;
+  rtree_search(
+      static_cast<rtree const*>(area_index_), to_array(min).data(),
+      to_array(max).data(),
+      [](double const*, double const*, void const*, void* udata) {
+        *static_cast<bool*>(udata) = true;
+        return false;
+      },
+      &found);
+  return found;
+}
+
+void area_ways::add_obstacles(std::vector<obstacle>&& obstacles) {
+  auto const l = std::scoped_lock{obstacle_mutex_};
+  obstacles_.insert(end(obstacles_), std::make_move_iterator(begin(obstacles)),
+                    std::make_move_iterator(end(obstacles)));
 }
 
 void area_ways::set_off_ground(way_idx_t const way) {
   off_ground_.resize(
       std::max(off_ground_.size(), static_cast<std::size_t>(to_idx(way)) + 1U));
   off_ground_[to_idx(way)] = true;
+}
+
+void area_ways::set_connector(way_idx_t const way) {
+  connector_.resize(
+      std::max(connector_.size(), static_cast<std::size_t>(to_idx(way)) + 1U));
+  connector_[to_idx(way)] = true;
+}
+
+void area_ways::add_elevator_node(osm_node_idx_t const n) {
+  elevator_nodes_.push_back(n);
 }
 
 void area_ways::add_barrier(std::span<osm_node_idx_t const> const nodes) {
@@ -158,11 +247,29 @@ area_ways::stats area_ways::build() {
 
   // Entries that are not on the outline. In `use` for the node budget, their
   // other_ ways are counted below.
+  std::ranges::sort(elevator_nodes_);
   auto const inside = find_interior(is_outline);
   auto s = stats{};
   s.n_crossings_ = inside.n_crossings_;
   for (auto const& e : inside.entries_) {
     use[e.node_];
+  }
+
+  // Obstacles: deterministic order, nodes can be entries (building
+  // entrances, gates).
+  std::ranges::sort(obstacles_, {}, &obstacle::id_);
+  auto* const obstacle_index = rtree_new();
+  utl::verify(obstacle_index != nullptr, "obstacle rtree creation failed");
+  for (auto i = std::size_t{0U}; i != obstacles_.size(); ++i) {
+    auto min = obstacles_[i].nodes_.front().second;
+    auto max = min;
+    for (auto const& [n, p] : obstacles_[i].nodes_) {
+      min = {std::min(min.lat_, p.lat_), std::min(min.lng_, p.lng_)};
+      max = {std::max(max.lat_, p.lat_), std::max(max.lng_, p.lng_)};
+      use[n];
+    }
+    rtree_insert(obstacle_index, to_array(min).data(), to_array(max).data(),
+                 reinterpret_cast<void*>(i));
   }
 
   for (auto way = way_idx_t{0U}; way != w_.n_ways(); ++way) {
@@ -228,12 +335,115 @@ area_ways::stats area_ways::build() {
     for (auto const& l : a.links_) {
       out << ' ' << l.from_ << ' ' << l.to_ << ' ' << l.length_;
     }
-    out << '\n';
+    out << "\nX " << std::min(a.n_routable_rings_, a.rings_.size()) << ' '
+        << a.lines_.size() << '\n';
+    for (auto const& l : a.lines_) {
+      out << "R " << l.size();
+      for (auto const& v : l) {
+        vertex(v);
+      }
+      out << '\n';
+    }
     auto const lock = std::scoped_lock{dump_mutex};
     *dump << out.str();
   };
 
+  // Buildings that stand on the area (a node strictly inside, on the level
+  // of the area) become holes, barrier segments with an end strictly inside
+  // (same level and layer) lines. The outline and the holes of the area
+  // decide what is inside: overlapping obstacles are not merged, each blocks
+  // on its own.
+  auto const add_obstacles = [&](area& a, generated& g) {
+    a.n_routable_rings_ = a.rings_.size();
+    if (obstacles_.empty() || a.rings_.empty() || a.rings_.front().empty()) {
+      return;
+    }
+    auto const n_rings = a.rings_.size();
+    auto const rings = std::span{a.rings_.data(), n_rings};
+    auto const is_inside = [&](point const p) {
+      return locate_in_rings(rings, p, &area::vertex::pos_) ==
+             point_location::kInside;
+    };
+
+    auto min = a.rings_.front().front().pos_;
+    auto max = min;
+    for (auto const& v : a.rings_.front()) {
+      min = {std::min(min.lat_, v.pos_.lat_), std::min(min.lng_, v.pos_.lng_)};
+      max = {std::max(max.lat_, v.pos_.lat_), std::max(max.lng_, v.pos_.lng_)};
+    }
+    auto candidates = std::vector<std::size_t>{};
+    rtree_search(
+        obstacle_index, to_array(min).data(), to_array(max).data(),
+        [](double const*, double const*, void const* item, void* udata) {
+          static_cast<std::vector<std::size_t>*>(udata)->push_back(
+              reinterpret_cast<std::size_t>(item));
+          return true;
+        },
+        &candidates);
+    std::ranges::sort(candidates);
+
+    auto const level = ground(g.p_.from_level());
+    auto const to_vertex = [&](std::pair<osm_node_idx_t, point> const& x) {
+      return area::vertex{.id_ = to_idx(x.first),
+                          .pos_ = x.second,
+                          .entry_ = is_entry(x.first),
+                          .blocked_ = is_blocked(x.first)};
+    };
+    auto rings_to_add = std::vector<area::ring>{};
+    for (auto const i : candidates) {
+      auto const& o = obstacles_[i];
+      auto const on_level =
+          o.has_level_ ? ((o.levels_ >> to_idx(level)) & 1U) != 0U
+                       : !o.on_pillars_ && level == level_t{0.F};
+      if (!on_level) {
+        continue;
+      }
+      auto const& nodes = o.nodes_;
+      if (o.kind_ == obstacle::kind::kBuilding) {
+        auto const closed =
+            nodes.size() > 3U && nodes.front().first == nodes.back().first;
+        if (!closed || std::ranges::none_of(nodes, [&](auto const& x) {
+              return is_inside(x.second);
+            })) {
+          continue;
+        }
+        auto& ring = rings_to_add.emplace_back();
+        for (auto j = 0U; j + 1U < nodes.size(); ++j) {
+          ring.push_back(to_vertex(nodes[j]));
+        }
+        ++g.n_holes_;
+      } else if (o.layer_ == g.layer_) {
+        // Runs of segments with at least one end inside.
+        auto in = std::vector<bool>(nodes.size());
+        for (auto j = 0U; j != nodes.size(); ++j) {
+          in[j] = is_inside(nodes[j].second);
+        }
+        auto line = area::ring{};
+        for (auto j = 1U; j < nodes.size(); ++j) {
+          if (in[j - 1U] || in[j]) {
+            if (line.empty()) {
+              line.push_back(to_vertex(nodes[j - 1U]));
+            }
+            line.push_back(to_vertex(nodes[j]));
+          } else if (!line.empty()) {
+            a.lines_.push_back(std::move(line));
+            line = {};
+            ++g.n_lines_;
+          }
+        }
+        if (!line.empty()) {
+          a.lines_.push_back(std::move(line));
+          ++g.n_lines_;
+        }
+      }
+    }
+    for (auto& r : rings_to_add) {
+      a.rings_.push_back(std::move(r));
+    }
+  };
+
   auto const run = [&](area& a, generated& g) {
+    add_obstacles(a, g);
     if (dump) {
       dump_area(a, g.id_);
     }
@@ -251,12 +461,14 @@ area_ways::stats area_ways::build() {
     g.n_visibility_edges_ = r.n_visibility_edges_;
     g.n_capped_ = r.n_capped_;
     g.junctions_ = std::move(r.junctions_);
-    for (auto const& way : r.ways_) {
+    for (auto i = 0U; i != r.ways_.size(); ++i) {
       auto& out = g.ways_.emplace_back();
-      for (auto const& v : way) {
+      for (auto const& v : r.ways_[i]) {
         auto const& x = get_vertex(a, v);
         out.emplace_back(osm_node_idx_t{x.id_}, x.pos_);
       }
+      out.front().first = osm_node_idx_t{r.end_ids_[i].first};
+      out.back().first = osm_node_idx_t{r.end_ids_[i].second};
     }
   };
 
@@ -276,6 +488,7 @@ area_ways::stats area_ways::build() {
       x.p_ = w_.r_->way_properties_[way];
       x.name_ = w_.way_names_[way];
       x.mixed_levels_ = x.p_.from_level_ != x.p_.to_level_;
+      x.layer_ = way_area_layers_[i];
 
       // Stored ways are closed: skip the repeated first node.
       auto& ring = a.rings_.emplace_back();
@@ -290,6 +503,7 @@ area_ways::stats area_ways::build() {
       x.id_ = to_area_way_idx(encode_osm_id(rel.id_), true);
       x.p_ = rel.p_;
       x.name_ = string_idx_t::invalid();
+      x.layer_ = rel.layer_;
       // Member ways can have their own tags (e.g. steps). A generated way
       // must not connect levels that the outline keeps apart.
       x.mixed_levels_ =
@@ -355,6 +569,7 @@ area_ways::stats area_ways::build() {
     g.p_ = in[i].p_;
     g.name_ = in[i].name_;
     g.mixed_levels_ = in[i].mixed_levels_;
+    g.layer_ = in[i].layer_;
     if (!g.mixed_levels_) {
       mark_touching(areas[i]);
       run(areas[i], g);
@@ -367,6 +582,7 @@ area_ways::stats area_ways::build() {
     auto g = generated{};
     g.id_ = in[m.members_.front()].id_;
     g.p_ = in[m.members_.front()].p_;
+    g.layer_ = in[m.members_.front()].layer_;
     g.name_ = string_idx_t::invalid();
     auto same_name = true;
     for (auto const i : m.members_) {
@@ -479,6 +695,8 @@ area_ways::stats area_ways::build() {
       continue;
     }
     s.n_interior_entries_ += g.n_interior_entries_;
+    s.n_building_holes_ += g.n_holes_;
+    s.n_barrier_lines_ += g.n_lines_;
     s.n_with_interior_ += g.n_interior_entries_ != 0U ? 1U : 0U;
     s.n_interior_dropped_ += g.interior_dropped_ ? 1U : 0U;
     switch (g.status_) {
@@ -570,6 +788,7 @@ area_ways::stats area_ways::build() {
       s.n_way_nodes_ += way.size();
     }
   }
+  rtree_free(obstacle_index);
   return s;
 }
 

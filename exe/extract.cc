@@ -20,10 +20,20 @@ struct config : public conf::configuration {
     param(out_, "out,o", "output directory");
     param(elevation_data_, "elevation_data,e", "directory with elevation data");
     param(with_platforms_, "with_platforms,p", "extract platform info");
+    param(areas_, "areas,a",
+          "ways across walkable areas: none, spanner (shortest paths between "
+          "the access points) or visibility (full visibility graph)");
+    param(area_stretch_, "area_stretch",
+          "spanner: allowed detour factor between two access points");
+    param(area_max_ways_, "area_max_ways",
+          "spanner: maximum number of generated ways at one node");
   }
 
   std::filesystem::path in_, out_, elevation_data_;
   bool with_platforms_{false};
+  std::string areas_{"none"};
+  double area_stretch_{area_routing_config{}.max_stretch_};
+  unsigned area_max_ways_{area_routing_config{}.max_ways_per_node_};
 };
 
 int main(int ac, char const** av) {
@@ -42,8 +52,19 @@ int main(int ac, char const** av) {
     return 1;
   }
 
+  auto areas = area_routing_config{.max_stretch_ = c.area_stretch_,
+                                   .max_ways_per_node_ = c.area_max_ways_};
+  if (c.areas_ == "spanner") {
+    areas.approach_ = area_routing_config::approach::kSpanner;
+  } else if (c.areas_ == "visibility") {
+    areas.approach_ = area_routing_config::approach::kVisibilityGraph;
+  } else if (c.areas_ != "none") {
+    fmt::println("unknown area routing approach {}", c.areas_);
+    return 1;
+  }
+
   utl::activate_progress_tracker("osr");
   auto const silencer = utl::global_progress_bars{false};
 
-  extract(c.with_platforms_, c.in_, c.out_, c.elevation_data_);
+  extract(c.with_platforms_, c.in_, c.out_, c.elevation_data_, areas);
 }

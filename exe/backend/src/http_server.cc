@@ -98,6 +98,16 @@ struct http_server::impl {
     } catch (fs::filesystem_error const& e) {
       throw utl::fail("static file directory not found: {}", e.what());
     }
+    // Ways generated across areas are not in the lookup r-tree.
+    for (auto i = way_idx_t{0U}; i != w_.n_ways(); ++i) {
+      if (is_area_way(w_.way_osm_idx_[i])) {
+        auto b = geo::box{};
+        for (auto const& c : w_.way_polylines_[i]) {
+          b.extend(c);
+        }
+        area_ways_.emplace_back(b, i);
+      }
+    }
   }
 
   static search_profile get_search_profile_from_request(
@@ -199,6 +209,12 @@ struct http_server::impl {
 
     auto gj = geojson_writer{.w_ = w_};
     l_.find({min, max}, [&](way_idx_t const w) { gj.write_way(w); });
+    auto const box = geo::box{min, max};
+    for (auto const& [b, w] : area_ways_) {
+      if (b.overlaps(box)) {
+        gj.write_way(w);
+      }
+    }
 
     gj.finish();
     cb(json_response(req, gj.string()));
@@ -348,6 +364,7 @@ private:
   elevation_storage const* elevations_;
   web_server server_;
   bool serve_static_files_{false};
+  std::vector<std::pair<geo::box, way_idx_t>> area_ways_;
   std::string static_file_path_;
 };
 

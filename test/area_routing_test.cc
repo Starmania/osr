@@ -98,18 +98,32 @@ struct flat {
       for (auto const& v : r) {
         v_.push_back(v);
       }
+      if (ring_begin_.size() ==
+          std::min(a.rings_.size(), a.n_routable_rings_)) {
+        n_routable_ = v_.size();
+      }
     }
     ring_begin_.push_back(v_.size());
     n_outline_ = v_.size();
+    n_routable_ = std::min(n_routable_, n_outline_);
     for (auto const& v : a.interior_) {
       v_.push_back(v);
     }
+    for (auto const& l : a.lines_) {
+      line_begin_.push_back(v_.size());
+      for (auto const& v : l) {
+        v_.push_back(v);
+      }
+    }
+    n_rings_ = a.rings_.size();
   }
 
   std::size_t idx(area_routing_result::vertex_ref const v) const {
     return v.ring_ == area_routing_result::vertex_ref::kInterior
                ? n_outline_ + v.idx_
-               : ring_begin_[v.ring_] + v.idx_;
+               : (v.ring_ < n_rings_
+                      ? ring_begin_[v.ring_] + v.idx_
+                      : line_begin_[v.ring_ - n_rings_] + v.idx_);
   }
 
   // Only for outline vertices.
@@ -123,10 +137,12 @@ struct flat {
   }
 
   // Outline vertices, followed by the entries that are not on the outline
-  // (which have to be strictly inside the area). Index = vertex id.
+  // (which have to be strictly inside the area) and the line vertices.
+  // Index = vertex id (see make_area).
   std::vector<area::vertex> v_;
-  std::vector<std::size_t> ring_begin_;
-  std::size_t n_outline_;
+  std::vector<std::size_t> ring_begin_, line_begin_;
+  std::size_t n_outline_, n_rings_;
+  std::size_t n_routable_{std::numeric_limits<std::size_t>::max()};
 };
 
 int sgn(std::int64_t const x) { return x > 0 ? 1 : (x < 0 ? -1 : 0); }
@@ -204,17 +220,35 @@ matrix reference_distances(area const& a) {
 }
 
 // Distances using only the generated ways (plus the outline if routable,
-// plus the links).
+// plus the links). Way ends are identified by end_ids_: vertex ids, or keys
+// of one side of a line vertex (extra nodes behind the vertices).
 matrix result_distances(area const& a,
                         area_routing_result const& r,
                         bool const with_outline) {
   auto const f = flat{a};
   auto const m = metric{a};
-  auto const n = f.v_.size();
+  auto keys = std::vector<std::uint64_t>{};
+  for (auto const& [from, to] : r.end_ids_) {
+    for (auto const k : {from, to}) {
+      if (k >= f.v_.size()) {
+        keys.push_back(k);
+      }
+    }
+  }
+  std::ranges::sort(keys);
+  keys.erase(std::unique(begin(keys), end(keys)), end(keys));
+  auto const node = [&](std::uint64_t const k) {
+    return k < f.v_.size()
+               ? k
+               : f.v_.size() + static_cast<std::size_t>(
+                                   std::ranges::lower_bound(keys, k) -
+                                   begin(keys));
+  };
+  auto const n = f.v_.size() + keys.size();
   auto d = matrix(n, std::vector<double>(n, kInf));
   for (auto i = 0U; i != n; ++i) {
     d[i][i] = 0.0;
-    if (with_outline && i < f.n_outline_) {
+    if (with_outline && i < f.n_routable_) {
       auto const nx = f.next(i);
       if (!f.v_[i].blocked_ && !f.v_[nx].blocked_) {
         d[i][nx] = d[nx][i] = m(f.v_[i].pos_, f.v_[nx].pos_);
@@ -230,7 +264,9 @@ matrix result_distances(area const& a,
     }
   }
   auto n_ends = std::vector<unsigned>(n);
-  for (auto const& w : r.ways_) {
+  EXPECT_EQ(r.ways_.size(), r.end_ids_.size());
+  for (auto k = 0U; k != r.ways_.size(); ++k) {
+    auto const& w = r.ways_[k];
     auto idx = std::vector<std::size_t>{};
     for (auto const& v : w) {
       idx.push_back(f.idx(v));
@@ -240,8 +276,8 @@ matrix result_distances(area const& a,
     for (auto i = 0U; i + 1U < idx.size(); ++i) {
       len += m(f.v_[idx[i]].pos_, f.v_[idx[i + 1U]].pos_);
     }
-    auto const from = idx.front();
-    auto const to = idx.back();
+    auto const from = node(r.end_ids_[k].first);
+    auto const to = node(r.end_ids_[k].second);
     d[from][to] = std::min(d[from][to], len);
     d[to][from] = d[from][to];
     ++n_ends[from];
@@ -249,7 +285,8 @@ matrix result_distances(area const& a,
   }
   // Ways end at entries or at junctions of more than two ways.
   for (auto i = 0U; i != n; ++i) {
-    EXPECT_TRUE(n_ends[i] == 0U || (f.v_[i].entry_ && !f.v_[i].blocked_) ||
+    EXPECT_TRUE(n_ends[i] == 0U ||
+                (i < f.v_.size() && f.v_[i].entry_ && !f.v_[i].blocked_) ||
                 n_ends[i] > 2U)
         << i;
   }
@@ -757,3 +794,178 @@ TEST(area_routing, random_areas_with_interior_entries_match_reference) {
   }
   EXPECT_GT(n_interior, 1000U);
 }
+
+namespace {
+
+// Appends a line, vertex ids continue after the rings, the interior points
+// and the lines added before. `entries` / `blocked`: indices on the line.
+void add_line(area& a,
+              ring_spec const& line,
+              std::set<std::size_t> const& entries = {},
+              std::set<std::size_t> const& blocked = {}) {
+  auto id = a.interior_.size();
+  for (auto const& r : a.rings_) {
+    id += r.size();
+  }
+  for (auto const& l : a.lines_) {
+    id += l.size();
+  }
+  auto& out = a.lines_.emplace_back();
+  for (auto i = 0U; i != line.size(); ++i) {
+    out.push_back({.id_ = id + i,
+                   .pos_ = point{static_cast<std::int32_t>(kX0 + line[i].x_),
+                                 static_cast<std::int32_t>(kY0 + line[i].y_)},
+                   .entry_ = entries.contains(i),
+                   .blocked_ = blocked.contains(i)});
+  }
+}
+
+double dist(area const& a, std::vector<pt> const& path) {
+  auto const m = metric{a};
+  auto d = 0.0;
+  for (auto i = 1U; i < path.size(); ++i) {
+    d += m(point{static_cast<std::int32_t>(kX0 + path[i - 1U].x_),
+                 static_cast<std::int32_t>(kY0 + path[i - 1U].y_)},
+           point{static_cast<std::int32_t>(kX0 + path[i].x_),
+                 static_cast<std::int32_t>(kY0 + path[i].y_)});
+  }
+  return d;
+}
+
+// 10000 x 10000 square, entries in the middle of the west side (5) and of
+// the east side (2).
+ring_spec west_east_square_ring() {
+  return {{0, 0},         {10000, 0}, {10000, 5000},
+          {10000, 10000}, {0, 10000}, {0, 5000}};
+}
+
+area west_east_square() {
+  return make_area({west_east_square_ring()}, {2U, 5U});
+}
+
+constexpr auto kW = pt{0, 5000};
+constexpr auto kE = pt{10000, 5000};
+
+}  // namespace
+
+TEST(area_routing, barrier_is_walked_around) {
+  auto a = west_east_square();
+  add_line(a, {{5000, 2000}, {5000, 8000}});
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, true)[5][2];
+  auto const expected = dist(a, {kW, {5000, 8000}, kE});
+  EXPECT_GE(d, expected - 1e-3);
+  EXPECT_LE(d, expected * 1.02 + 1e-3);
+}
+
+TEST(area_routing, barrier_sides_are_not_connected) {
+  // Zig-zag: walking along the segment between the two bends would switch
+  // from the west to the east side (W -> 7 -> 8 -> E: 11.1 vs 12.8 units).
+  auto a = west_east_square();
+  add_line(a, {{5000, 1000}, {4000, 4000}, {6000, 6000}, {5000, 9000}});
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, true)[5][2];
+  auto const expected = dist(a, {kW, {5000, 9000}, kE});
+  EXPECT_GE(d, expected - 1e-3);
+  EXPECT_LE(d, expected * 1.02 + 1e-3);
+  EXPECT_LT(dist(a, {kW, {4000, 4000}, {6000, 6000}, kE}) * 1.1, expected);
+}
+
+TEST(area_routing, barrier_gate) {
+  // Wall from the south to the north side with a gate (entry) in the middle.
+  auto a = west_east_square();
+  add_line(a, {{5000, 0}, {5000, 5000}, {5000, 10000}}, {1U});
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, false);
+  EXPECT_NEAR(dist(a, {kW, kE}), d[5][2], 1e-3);  // 5 -> gate (7) -> 2
+
+  // Blocked gate: no way through, only along the outline.
+  auto b = west_east_square();
+  add_line(b, {{5000, 0}, {5000, 5000}, {5000, 10000}}, {1U}, {1U});
+  auto const rb = compute_area_ways(b);
+  ASSERT_EQ(area_routing_status::kOk, rb.status_);
+  EXPECT_GE(result_distances(b, rb, false)[5][2], kInf / 2.0);
+  EXPECT_NEAR(dist(b, {kW, {0, 10000}, {10000, 10000}, kE}),
+              result_distances(b, rb, true)[5][2], 1e-3);
+}
+
+TEST(area_routing, closed_barrier) {
+  // A fence around the center, the entry inside (6) cannot be reached.
+  auto a = make_area({west_east_square_ring()}, {2U, 5U}, {{5000, 5000}});
+  add_line(a, {{3000, 3000},
+               {7000, 3000},
+               {7000, 7000},
+               {3000, 7000},
+               {3000, 3000}});
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, false);
+  EXPECT_NEAR(dist(a, {kW, {3000, 3000}, {7000, 3000}, kE}), d[5][2],
+              dist(a, {kW, kE}) * 0.02);
+  EXPECT_GE(d[5][6], kInf / 2.0);
+  EXPECT_GE(d[2][6], kInf / 2.0);
+}
+
+TEST(area_routing, building_wall_is_not_routable) {
+  // Building (hole) with two entrances (7, 8). Its wall is no way: the
+  // entrances are connected by a generated way along it.
+  auto rings = std::vector<ring_spec>{west_east_square_ring(),
+                                      {{3000, 3000},
+                                       {7000, 3000},
+                                       {7000, 7000},
+                                       {3000, 7000}}};
+  auto a = make_area(rings, {2U, 5U, 6U, 7U});
+  a.n_routable_rings_ = 1U;
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  EXPECT_NEAR(dist(a, {{3000, 3000}, {7000, 3000}}),
+              result_distances(a, r, true)[6][7], 1e-3);
+
+  // The inner ring of a multipolygon is a way: no generated way along it.
+  auto b = make_area(rings, {2U, 5U, 6U, 7U});
+  auto const rb = compute_area_ways(b);
+  ASSERT_EQ(area_routing_status::kOk, rb.status_);
+  for (auto const& w : way_ids(b, rb)) {
+    EXPECT_FALSE((w.front() == 6U && w.back() == 7U) ||
+                 (w.front() == 7U && w.back() == 6U));
+  }
+}
+
+TEST(area_routing, overlapping_holes) {
+  // Two buildings that overlap: no path through the overlap.
+  auto a = make_area(
+      {west_east_square_ring(),
+       {{3000, 4000}, {6000, 4000}, {6000, 7000}, {3000, 7000}},
+       {{5000, 3000}, {8000, 3000}, {8000, 6000}, {5000, 6000}}},
+      {2U, 5U});
+  a.n_routable_rings_ = 1U;
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, false)[5][2];
+  auto const expected =
+      std::min(dist(a, {kW, {3000, 7000}, {6000, 7000}, {8000, 6000}, kE}),
+               dist(a, {kW, {3000, 4000}, {5000, 3000}, {8000, 3000}, kE}));
+  EXPECT_GE(d, expected - 1e-3);
+  EXPECT_LE(d, expected * 1.02 + 1e-3);
+}
+
+TEST(area_routing, building_crossing_the_outline) {
+  // The building sticks out of the north side and blocks the straight line
+  // between the entries 4 and 5 inside the area: around it in the south.
+  auto a = make_area(
+      {{{0, 0}, {10000, 0}, {10000, 10000}, {0, 10000}},
+       {{4000, 7000}, {6000, 7000}, {6000, 12000}, {4000, 12000}}},
+      {0U}, {{2000, 9000}, {8000, 9000}});
+  a.n_routable_rings_ = 1U;
+  auto const r = compute_area_ways(a);
+  ASSERT_EQ(area_routing_status::kOk, r.status_);
+  auto const d = result_distances(a, r, true)[8][9];
+  auto const expected =
+      dist(a, {{2000, 9000}, {4000, 7000}, {6000, 7000}, {8000, 9000}});
+  EXPECT_GE(d, expected - 1e-3);
+  EXPECT_LE(d, expected * 1.02 + 1e-3);
+}
+

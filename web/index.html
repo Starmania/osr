@@ -103,6 +103,26 @@
             top: 134px;
         }
 
+        #route-legend {
+            position: absolute;
+            bottom: 30px;
+            right: 5px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 6px 8px;
+            border-radius: 4px;
+            font: 12px sans-serif;
+            line-height: 18px;
+        }
+
+        #route-legend span {
+            display: inline-block;
+            width: 22px;
+            height: 5px;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
         #journey-info {
             color: white;
             position: absolute;
@@ -143,6 +163,15 @@
 </select>
 <input id="foot-speed" type="number" value="1.2" min="0.1" step="0.1"
        onchange="setSpeed(event)"/>
+<div id="route-legend">
+    <div><span style="background:#c4541d"></span>level 3</div>
+    <div><span style="background:#f0a46b"></span>level 1</div>
+    <div><span style="background:#9ec5f4"></span>level 0</div>
+    <div><span style="background:#5f9fe8"></span>level -1</div>
+    <div><span style="background:#2a78d6"></span>level -2</div>
+    <div><span style="background:#123a6e"></span>level -4</div>
+    <div><span style="background:repeating-linear-gradient(90deg,#52514e 0 3px,transparent 3px 6px)"></span>generated way</div>
+</div>
 <div id="journey-info">
     Test
 </div>
@@ -150,8 +179,11 @@
 <script type="module">
     import {style} from "./style.js";
 
-    const start = [8.65749737, 50.10416625]
-    const destination = [8.65750757, 50.10417645];
+    // #zoom/lat/lng in the URL (map hash) also places start and destination.
+    const at = location.hash.slice(1).split("/").map(Number);
+    const start = at.length >= 3 && at.every(Number.isFinite)
+        ? [at[2], at[1]] : [8.65749737, 50.10416625];
+    const destination = [start[0] + 0.00001, start[1] + 0.00001];
     const query = {
         start, destination,
         max: 14400,
@@ -179,6 +211,7 @@
             layers: [],
         },
         zoom: 18,
+        hash: true,
         transformRequest: (url, resourceType) => {
             if (url.startsWith('/')) {
                 return {url: `https://europe.motis-project.de/tiles${url}`}
@@ -244,11 +277,13 @@
             body: JSON.stringify({
                 start: {
                     lat: query.start[1],
-                    lng: query.start[0]
+                    lng: query.start[0],
+                    level: query.start_level
                 },
                 destination: {
                     lat: query.destination[1],
-                    lng: query.destination[0]
+                    lng: query.destination[0],
+                    level: query.destination_level
                 },
                 profile: query.profile,
                 direction: query.direction,
@@ -350,6 +385,15 @@
         })
     }
 
+    // Street level light, underground darker, upper levels warm.
+    const levelColor = [
+        'interpolate', ['linear'], ['coalesce', ['get', 'level'], 0],
+        -4, '#123a6e', -2, '#2a78d6', -1, '#5f9fe8', 0, '#9ec5f4',
+        1, '#f0a46b', 3, '#c4541d'
+    ];
+    // Ways generated across areas have bit 62 of their way id set.
+    const isAreaWay = ['>=', ['get', 'osm_way_id'], 4611686018427387904];
+
     const addRouting = async () => {
         map.addSource('path', {
             type: 'geojson',
@@ -362,35 +406,41 @@
             'layout': {
                 'line-join': 'round',
                 'line-cap': 'round',
+                'line-sort-key': ['coalesce', ['get', 'level'], 0]
             },
-            'filter': [
-                'any',
-                ['!has', 'level'],
-                ['==', 'level', currentLevel]
-            ],
             'paint': {
-                'line-color': '#1966a4',
-                'line-width': 7.5,
-                'line-opacity': 0.8
+                'line-color': '#ffffff',
+                'line-width': 8
             }
         });
         map.addLayer({
             'id': 'path',
             'type': 'line',
             'source': 'path',
+            'filter': ['!', isAreaWay],
             'layout': {
                 'line-join': 'round',
                 'line-cap': 'round',
+                'line-sort-key': ['coalesce', ['get', 'level'], 0]
             },
-            'filter': [
-                'any',
-                ['!has', 'level'],
-                ['==', 'level', currentLevel]
-            ],
             'paint': {
-                'line-color': '#42a5f5',
+                'line-color': levelColor,
+                'line-width': 5
+            }
+        });
+        map.addLayer({
+            'id': 'path-generated',
+            'type': 'line',
+            'source': 'path',
+            'filter': isAreaWay,
+            'layout': {
+                'line-join': 'round',
+                'line-sort-key': ['coalesce', ['get', 'level'], 0]
+            },
+            'paint': {
+                'line-color': levelColor,
                 'line-width': 5,
-                'line-opacity': 0.8
+                'line-dasharray': [0.6, 0.6]
             }
         });
     }
@@ -408,6 +458,12 @@
         await updateLevels();
         await addRouting();
     });
+
+    const removeGraph = () => {
+        ['graph-geometry', 'graph-edge', 'graph-node', 'platform-node',
+         'platform-edge'].forEach((l) => map.getLayer(l) && map.removeLayer(l));
+        ['graph', 'platform'].forEach((s) => map.getSource(s) && map.removeSource(s));
+    };
 
     const updateGraph = async () => {
         const removeGraph = () => {

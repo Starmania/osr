@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "osr/point.h"
@@ -29,8 +31,18 @@ struct area {
 
   // rings_[0] is the outer ring, all others are holes. A hole that consists
   // of a single entry is a point inside the area that can be walked to and
-  // from in any direction (not an obstacle).
+  // from in any direction (not an obstacle). Holes may overlap each other and
+  // the outer ring (e.g. buildings standing on the area).
   std::vector<ring> rings_;
+
+  // The first n_routable_rings_ rings are part of the routing graph (see
+  // ring_routable_), the others are not (e.g. building walls).
+  std::size_t n_routable_rings_{std::numeric_limits<std::size_t>::max()};
+
+  // Lines that cannot be crossed (barriers such as walls and fences), both
+  // sides are walkable. A line whose first and last vertex are at the same
+  // position is closed. Vertices can be entries (e.g. a gate).
+  std::vector<ring> lines_;
 
   // Entries that are not on the outline (e.g. the end of a footway that
   // leads into the area): free-standing points that can be reached from all
@@ -84,8 +96,8 @@ enum class area_routing_status : std::uint8_t {
 };
 
 struct area_routing_result {
-  // A vertex of the input: rings_[ring_][idx_], or interior_[idx_] if
-  // ring_ == kInterior.
+  // A vertex of the input: rings_[ring_][idx_], interior_[idx_] if
+  // ring_ == kInterior, or lines_[ring_ - rings_.size()][idx_].
   struct vertex_ref {
     static constexpr auto kInterior =
         std::numeric_limits<std::uint32_t>::max();
@@ -101,7 +113,12 @@ struct area_routing_result {
   // id), not the outline node: the outline does not pass through it.
   std::vector<std::vector<vertex_ref>> ways_;
 
-  // Vertex ids of the junctions, sorted.
+  // Ids of the first and the last vertex of each way. The same as the
+  // vertex ids, except at junctions on one side of a line (they get a key
+  // of their own, the other side is not connected).
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> end_ids_;
+
+  // Ids (as in end_ids_) of the junctions, sorted.
   std::vector<std::uint64_t> junctions_;
 
   // Statistics: line-of-sight edges that survived all filters, entry pairs
@@ -119,7 +136,9 @@ inline area::vertex const& get_vertex(
     area const& a, area_routing_result::vertex_ref const v) {
   return v.ring_ == area_routing_result::vertex_ref::kInterior
              ? a.interior_[v.idx_]
-             : a.rings_[v.ring_][v.idx_];
+             : (v.ring_ < a.rings_.size()
+                    ? a.rings_[v.ring_][v.idx_]
+                    : a.lines_[v.ring_ - a.rings_.size()][v.idx_]);
 }
 
 // Computes the ways required to cross the area on (nearly) shortest paths

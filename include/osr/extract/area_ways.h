@@ -47,6 +47,9 @@ struct area_ways {
     // Places where a walkable way crosses an area outline without a common
     // node (not connected to the area there).
     std::uint64_t n_crossings_{0U};
+    // Obstacles: buildings standing on areas (holes), barrier lines.
+    std::uint64_t n_building_holes_{0U};
+    std::uint64_t n_barrier_lines_{0U};
 
     // Merging of adjacent areas (see merge_areas). Merged areas count as one
     // in n_no_entries_, n_too_large_, n_invalid_ and n_ok_.
@@ -85,14 +88,31 @@ struct area_ways {
     kAllNodes
   };
 
+  // A building or a barrier that may stand on an area (see add_obstacles).
+  struct obstacle {
+    enum class kind : std::uint8_t { kBuilding, kBarrier };
+    osm_way_idx_t id_;
+    kind kind_;
+    // The levels it is on (level tag), the ground level without.
+    level_bits_t levels_;
+    bool has_level_;
+    // building:min_level > 0 or min_height > 2.5m: does not block the ground
+    // below, only its own levels.
+    bool on_pillars_;
+    std::int8_t layer_;
+    std::vector<std::pair<osm_node_idx_t, point>> nodes_;
+  };
+
   explicit area_ways(
       ways& w,
       area_routing_options const& opt = {},
-      interior_entries const interior = interior_entries::kAllNodes)
-      : w_{w}, opt_{opt}, interior_{interior} {}
+      interior_entries const interior = interior_entries::kAllNodes);
+  ~area_ways();
+  area_ways(area_ways const&) = delete;
+  area_ways& operator=(area_ways const&) = delete;
 
   // A closed way that is an area. Its outline is the stored way.
-  void add_way(way_idx_t);
+  void add_way(way_idx_t, std::int8_t layer = 0);
 
   // One outer ring of a multipolygon relation with its holes. Rings are open
   // (first node not repeated). `member_ways` are the stored ways the outline
@@ -101,11 +121,31 @@ struct area_ways {
                     std::vector<ring> rings,
                     std::vector<way_idx_t> member_ways,
                     way_properties,
-                    bool off_ground = false);
+                    bool off_ground = false,
+                    std::int8_t layer = 0);
+
+  // After all areas are added: is the box (min, max) close to an area?
+  // Obstacles elsewhere are not needed.
+  void index_areas();
+  bool is_near_area(point min, point max) const;
+
+  // Buildings and barriers close to areas. Buildings with a node strictly
+  // inside an area (on its level) are holes, barrier segments with an end
+  // strictly inside (same level and layer) are lines that cannot be crossed.
+  // Can be called concurrently.
+  void add_obstacles(std::vector<obstacle>&&);
+  std::size_t n_obstacles() const { return obstacles_.size(); }
 
   // The way is not on the ground (tunnel, bridge, layer): what is inside an
   // area on the map is not on the area then, and the other way round.
   void set_off_ground(way_idx_t);
+
+  // Steps, ramps and elevators connect levels: their nodes inside an area
+  // are entries whatever their level (see area_ways_interior.cc).
+  void set_connector(way_idx_t);
+
+  // A node with highway=elevator: serves all levels.
+  void add_elevator_node(osm_node_idx_t);
 
   // A way that is not stored but must not be crossed (wall, fence, ...):
   // areas are not merged across it. Can be called concurrently.
@@ -128,6 +168,7 @@ private:
     std::vector<way_idx_t> member_ways_;
     way_properties p_;
     bool off_ground_;
+    std::int8_t layer_;
   };
 
   // Entries that are not on the outline, see area_ways_interior.cc. area_ is
@@ -154,8 +195,17 @@ private:
   area_routing_options opt_;
   interior_entries interior_;
   std::vector<way_idx_t> way_areas_;
+  std::vector<std::int8_t> way_area_layers_;
   std::vector<relation_area> relation_areas_;
+
+  // R-tree over the bounding boxes of the areas (index_areas).
+  void* area_index_{nullptr};
+
+  std::mutex obstacle_mutex_;
+  std::vector<obstacle> obstacles_;
   std::vector<bool> off_ground_;
+  std::vector<bool> connector_;
+  std::vector<osm_node_idx_t> elevator_nodes_;
 
   // Hashes of the barrier segments (both nodes).
   std::mutex barrier_mutex_;

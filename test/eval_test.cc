@@ -109,7 +109,7 @@ TEST(tmp, eval) {
         auto const p = osr::route(
             osr::get_parameters(osr::search_profile::kFoot), w, l,
             osr::search_profile::kFoot, osr::location{{a, b}, osr::kNoLevel},
-            osr::location{{c, d}, osr::kNoLevel}, 3600U,
+            osr::location{{c, d}, osr::kNoLevel}, std::chrono::seconds{3600},
             osr::direction::kForward, 100.0, nullptr, nullptr, nullptr, algo);
         auto const us = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - start)

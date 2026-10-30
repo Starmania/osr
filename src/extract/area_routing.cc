@@ -23,6 +23,11 @@ constexpr auto kMaxExtent = coord_t{1} << 24U;
 
 constexpr auto kInvalid = std::numeric_limits<std::uint32_t>::max();
 
+// Key of one side of a line vertex that is no entry (see lines_): the sides
+// must not share a search node, else paths would cross the line there.
+constexpr auto kLineSideBit =
+    (std::uint64_t{1U} << 62U) | (std::uint64_t{1U} << 61U);
+
 struct vec2 {
   friend vec2 operator-(vec2 const a, vec2 const b) {
     return {a.x_ - b.x_, a.y_ - b.y_};
@@ -55,6 +60,9 @@ struct corner {
   // Free-standing point inside the area: no outline (prev_ == next_ ==
   // itself), stored after all outline corners.
   bool free_;
+  // End of an open line (prev_ == next_): walkable in every direction except
+  // along the line, paths bend around it.
+  bool end_{false};
 };
 
 // Is the direction d, seen from corner c, pointing into the walkable side?
@@ -66,6 +74,9 @@ bool points_inside(std::vector<corner> const& corners,
   }
   auto const a = corners[c.next_].pos_ - c.pos_;
   auto const b = corners[c.prev_].pos_ - c.pos_;
+  if (c.end_) {
+    return cross(a, d) != 0 || dot(a, d) < 0;
+  }
   if (c.prev_ == c.next_ && a == vec2{0, 0}) {
     return true;  // single vertex inside the area
   }
@@ -208,7 +219,11 @@ area_routing_result compute_area_ways(area const& a,
   auto const origin = a.rings_.front().front().pos_;
   auto corners = std::vector<corner>{};
   auto ids = std::vector<std::uint64_t>{};
-  auto ring_ranges = std::vector<std::pair<std::uint32_t, std::uint32_t>>{};
+  struct ring_range {
+    std::uint32_t base_, n_;
+    bool routable_;  // part of the routing graph (see ring_routable_)
+  };
+  auto ring_ranges = std::vector<ring_range>{};
   for (auto r = 0U; r != a.rings_.size(); ++r) {
     auto const& ring = a.rings_[r];
     auto const n = static_cast<std::uint32_t>(ring.size());
@@ -244,7 +259,7 @@ area_routing_result compute_area_ways(area const& a,
     }
     if (is_point) {
       // Its own neighbor: no outline segment, never reflex.
-      ring_ranges.emplace_back(base, n);
+      ring_ranges.push_back({base, n, false});
       continue;
     }
     if (doubled_area == 0) {
@@ -262,7 +277,103 @@ area_routing_result compute_area_ways(area const& a,
         std::swap(corners[i].prev_, corners[i].next_);
       }
     }
-    ring_ranges.emplace_back(base, n);
+    ring_ranges.push_back({base, n, r < a.n_routable_rings_});
+  }
+
+  // Lines (barriers), walkable on both sides: an open line becomes a ring
+  // around it (there and back) whose ends are spikes, a closed line two
+  // rings, one per side.
+  auto const n_rings = static_cast<std::uint32_t>(a.rings_.size());
+  auto const same_pos = [](area::vertex const& x, area::vertex const& y) {
+    return x.pos_.lat_ == y.pos_.lat_ && x.pos_.lng_ == y.pos_.lng_;
+  };
+  // An end of a line is only walked around if it is free: strictly inside
+  // the area and not on another line. A fence that ends at the outline, at
+  // a wall or at another fence leaves no gap.
+  using line_position = std::tuple<std::int32_t, std::int32_t, std::uint32_t>;
+  auto line_positions = std::vector<line_position>{};
+  for (auto l = 0U; l != a.lines_.size(); ++l) {
+    for (auto const& v : a.lines_[l]) {
+      line_positions.emplace_back(v.pos_.lat_, v.pos_.lng_, l);
+    }
+  }
+  std::ranges::sort(line_positions);
+  auto const is_free_end = [&](area::vertex const& v, std::uint32_t const l) {
+    auto const [lo, hi] = std::ranges::equal_range(
+        line_positions, std::pair{v.pos_.lat_, v.pos_.lng_}, {},
+        [](line_position const& x) {
+          return std::pair{std::get<0>(x), std::get<1>(x)};
+        });
+    return std::all_of(
+               lo, hi,
+               [&](line_position const& x) { return std::get<2>(x) == l; }) &&
+           locate_in_rings(a.rings_, v.pos_, &area::vertex::pos_) ==
+               point_location::kInside;
+  };
+
+  auto seq = std::vector<std::uint32_t>{};
+  auto line_ids = std::vector<std::uint64_t>{};
+  for (auto l = 0U; l != a.lines_.size(); ++l) {
+    auto const& line = a.lines_[l];
+    seq.clear();
+    for (auto i = 0U; i != line.size(); ++i) {
+      if (seq.empty() || !same_pos(line[i], line[seq.back()])) {
+        seq.push_back(i);
+      }
+    }
+    auto const closed =
+        seq.size() > 3U && same_pos(line[seq.front()], line[seq.back()]);
+    if (closed) {
+      seq.pop_back();
+    }
+    if (seq.size() < 2U) {
+      continue;
+    }
+
+    auto const add_ring = [&](bool const is_open) {
+      auto const base = static_cast<std::uint32_t>(corners.size());
+      auto const n = static_cast<std::uint32_t>(seq.size());
+      auto const last_end = (n + 2U) / 2U - 1U;  // index of the far end
+      for (auto k = 0U; k != n; ++k) {
+        auto const& v = line[seq[k]];
+        auto const pos = vec2{static_cast<coord_t>(v.pos_.lat_) - origin.lat_,
+                              static_cast<coord_t>(v.pos_.lng_) - origin.lng_};
+        if (std::abs(pos.x_) >= kMaxExtent || std::abs(pos.y_) >= kMaxExtent) {
+          return false;
+        }
+        corners.push_back({.pos_ = pos,
+                           .prev_ = base + (k + n - 1U) % n,
+                           .next_ = base + (k + 1U) % n,
+                           .node_ = kInvalid,
+                           .ref_ = {n_rings + l, seq[k]},
+                           .entry_ = v.entry_,
+                           .reflex_ = false,
+                           .free_ = false,
+                           .end_ = is_open && (k == 0U || k == last_end) &&
+                                   is_free_end(v, l)});
+        ids.push_back(v.entry_ && !v.blocked_
+                          ? v.id_
+                          : kLineSideBit | (corners.size() - 1U));
+        line_ids.push_back(v.id_);
+      }
+      ring_ranges.push_back({base, n, false});
+      return true;
+    };
+    if (closed) {
+      auto ok = add_ring(false);
+      std::ranges::reverse(seq);
+      ok = ok && add_ring(false);
+      if (!ok) {
+        return fail(area_routing_status::kTooLarge);
+      }
+    } else {
+      for (auto i = seq.size() - 1U; i-- > 1U;) {
+        seq.push_back(seq[i]);
+      }
+      if (!add_ring(true)) {
+        return fail(area_routing_status::kTooLarge);
+      }
+    }
   }
 
   // Entries that are not on the outline: point corners behind the outline
@@ -271,6 +382,7 @@ area_routing_result compute_area_ways(area const& a,
   auto const n_outline = static_cast<std::uint32_t>(corners.size());
   if (!a.interior_.empty()) {
     auto outline_ids = ids;
+    outline_ids.insert(end(outline_ids), begin(line_ids), end(line_ids));
     std::ranges::sort(outline_ids);
     for (auto i = 0U; i != a.interior_.size(); ++i) {
       auto const& v = a.interior_[i];
@@ -297,8 +409,8 @@ area_routing_result compute_area_ways(area const& a,
   }
 
   for (auto& c : corners) {
-    c.reflex_ = cross(c.pos_ - corners[c.prev_].pos_,
-                      corners[c.next_].pos_ - c.pos_) < 0;
+    c.reflex_ = c.end_ || cross(c.pos_ - corners[c.prev_].pos_,
+                                corners[c.next_].pos_ - c.pos_) < 0;
   }
 
   // Search graph nodes: one per distinct vertex id.
@@ -451,8 +563,8 @@ area_routing_result compute_area_ways(area const& a,
     auto const is_blocked = [&](std::uint32_t const i) {
       return get_vertex(a, corners[i].ref_).blocked_;
     };
-    for (auto const& [base, n] : ring_ranges) {
-      if (n < 2U) {
+    for (auto const& [base, n, routable] : ring_ranges) {
+      if (n < 2U || !routable) {
         continue;
       }
       // Walk the ring once, starting at a blocked vertex if there is one:
@@ -622,6 +734,7 @@ area_routing_result compute_area_ways(area const& a,
           }
         }
       }
+      result.end_ids_.emplace_back(node_ids[start], node_ids[curr]);
       for (auto const& c : chain) {
         done.insert(std::ranges::upper_bound(done, c), c);
       }

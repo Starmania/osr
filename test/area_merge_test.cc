@@ -429,7 +429,8 @@ struct graph {
     fs::remove_all(dir_, ec);
     fs::create_directories(dir_, ec);
 
-    extract(false, osm_path.generic_string(), dir_, {});
+    extract(false, osm_path.generic_string(), dir_, {}, {},
+            {.approach_ = area_routing_config::approach::kSpanner});
     w_ = std::make_unique<ways>(dir_, cista::mmap::protection::READ);
     l_ = std::make_unique<lookup>(*w_, dir_, cista::mmap::protection::READ);
   }
@@ -437,7 +438,7 @@ struct graph {
   path route(location const& from, location const& to) const {
     auto const p =
         osr::route(get_parameters(search_profile::kFoot), *w_, *l_,
-                   search_profile::kFoot, from, to, 10'000U,
+                   search_profile::kFoot, from, to, std::chrono::seconds{10'000},
                    direction::kForward, 50.0, nullptr, nullptr, nullptr,
                    routing_algorithm::kDijkstra);
     EXPECT_TRUE(p.has_value());
